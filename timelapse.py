@@ -13,7 +13,8 @@ class TimelapseApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Mac Timelapse Recorder")
-        self.root.geometry("350x250") 
+        # Kept the slightly taller window to fit the speed dropdown
+        self.root.geometry("350x320") 
         
         self.is_recording = False
         self.record_thread = None
@@ -26,7 +27,8 @@ class TimelapseApp:
         self.build_ui()
 
     def build_ui(self):
-        tk.Label(self.root, text="Select Screen:", font=("Helvetica", 14)).pack(pady=(20, 5))
+        # Screen Selection
+        tk.Label(self.root, text="Select Screen:", font=("Helvetica", 12)).pack(pady=(15, 0))
         
         self.screen_var = tk.StringVar()
         monitor_options = [f"Screen {i+1} ({m['width']}x{m['height']})" for i, m in enumerate(self.monitors)]
@@ -36,6 +38,17 @@ class TimelapseApp:
         self.dropdown = ttk.Combobox(self.root, textvariable=self.screen_var, values=monitor_options, state="readonly", width=25)
         self.dropdown.pack(pady=5)
         
+        # Speed Selection Dropdown
+        tk.Label(self.root, text="Timelapse Speed:", font=("Helvetica", 12)).pack(pady=(10, 0))
+        
+        self.speed_var = tk.StringVar()
+        speed_options = ["Slower (More Detail)", "Standard (iPhone Match)", "Faster (Quick Summary)"]
+        self.speed_var.set(speed_options[1]) # Default to standard
+        
+        self.speed_dropdown = ttk.Combobox(self.root, textvariable=self.speed_var, values=speed_options, state="readonly", width=25)
+        self.speed_dropdown.pack(pady=5)
+        
+        # Start/Stop Button
         self.record_btn = tk.Button(self.root, text="Start Recording", command=self.toggle_recording, width=15, height=2, font=("Helvetica", 12, "bold"))
         self.record_btn.pack(pady=20)
         
@@ -56,6 +69,7 @@ class TimelapseApp:
         self.record_btn.config(text="Stop Recording", fg="red")
         self.status_label.config(text="Recording...", fg="red")
         self.dropdown.config(state="disabled") 
+        self.speed_dropdown.config(state="disabled") # Lock speed while recording
         
         self.record_thread = threading.Thread(target=self.iphone_capture_loop)
         self.record_thread.start()
@@ -69,25 +83,25 @@ class TimelapseApp:
         selected_idx = self.dropdown.current()
         monitor = self.monitors[selected_idx]
         
-        # Fresh temporary directory for images
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
         os.makedirs(self.temp_dir)
         
-        # --- SMOOTHNESS MULTIPLIER ---
-        # 1 = Exact iPhone logic (30 FPS, choppy screen). 
-        # 2 = Double frame data (60 FPS, incredibly smooth, exact same video length).
+        # Map the UI selection to a math multiplier
+        speed_choice = self.speed_var.get()
+        if "Slower" in speed_choice:
+            multiplier = 0.5  # Captures twice as often
+        elif "Faster" in speed_choice:
+            multiplier = 2.0  # Captures half as often
+        else:
+            multiplier = 1.0  # Standard
+            
         smooth = 2 
         playback_fps = 30 * smooth
         
-        # Apple's Tier System adjusted for smoothness
-        # Tier 0 (< 10 mins): Captures 2 frames per second (1 frame every 0.5 seconds).
-        # Tier 1 (10-20 mins): Captures 1 frame per second.
-        # Tier 2 (20-40 mins): Captures 1 frame every 2 seconds.
-        # Tier 3 (40-80 mins): Captures 1 frame every 4 seconds.
-        # Tier 4 (> 80 mins): Captures 1 frame every 8 seconds.
+        # Apply the multiplier to the base iPhone logic
         base_intervals = [0.5, 1.0, 2.0, 4.0, 8.0]
-        intervals = [i / smooth for i in base_intervals]
+        intervals = [(i * multiplier) / smooth for i in base_intervals]
         
         tier = 0
         frame_counter = 0
@@ -98,7 +112,7 @@ class TimelapseApp:
                 loop_start = time.time()
                 elapsed_seconds = loop_start - start_time
                 
-                # Dynamic Interval Engine: Checks if we crossed an iPhone time boundary
+                # Dynamic Drop-Frames Logic
                 if elapsed_seconds >= 80 * 60 and tier == 3:
                     self.drop_half_frames()
                     tier = 4
@@ -114,12 +128,12 @@ class TimelapseApp:
                     
                 current_interval = intervals[tier]
                 
-                # Capture and format
+                # Capture
                 img = sct.grab(monitor)
                 frame = np.array(img)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                 
-                # Save to disk
+                # Save to disk at FULL resolution and default high quality
                 filepath = os.path.join(self.temp_dir, f"frame_{frame_counter:08d}.jpg")
                 cv2.imwrite(filepath, frame)
                 frame_counter += 1
@@ -128,22 +142,25 @@ class TimelapseApp:
                 loop_duration = time.time() - loop_start
                 time.sleep(max(0, current_interval - loop_duration))
                 
+        # Pass the original monitor width and height back to the compiler
         self.compile_final_video(monitor["width"], monitor["height"], playback_fps)
 
     def drop_half_frames(self):
-        """This mimics the iOS logic: delete 50% of the past frames to maintain a small file size."""
         files = sorted(os.listdir(self.temp_dir))
         for index, filename in enumerate(files):
-            # Delete every odd-numbered frame
             if index % 2 != 0:
                 os.remove(os.path.join(self.temp_dir, filename))
 
     def compile_final_video(self, width, height, fps):
-        """Stitch the surviving frames into the final video."""
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        files = sorted(os.listdir(self.temp_dir))
+        
+        if not files:
+            self.root.after(0, lambda: self.status_label.config(text="No frames captured.", fg="red"))
+            return
+            
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         out = cv2.VideoWriter(self.current_filename, fourcc, fps, (width, height))
         
-        files = sorted(os.listdir(self.temp_dir))
         for filename in files:
             filepath = os.path.join(self.temp_dir, filename)
             frame = cv2.imread(filepath)
@@ -151,17 +168,15 @@ class TimelapseApp:
                 out.write(frame)
                 
         out.release()
-        
-        # Clean up temporary hard drive data
         shutil.rmtree(self.temp_dir)
         
-        # Return to UI safely
         self.root.after(0, self.finish_processing)
 
     def finish_processing(self):
-        self.status_label.config(text=f"Done! Saved to {self.current_filename}", fg="green")
+        self.status_label.config(text=f"Done! Saved {self.current_filename}", fg="green")
         self.record_btn.config(text="Start Recording", fg="black", state="normal")
         self.dropdown.config(state="readonly")
+        self.speed_dropdown.config(state="readonly")
 
 if __name__ == "__main__":
     root = tk.Tk()
